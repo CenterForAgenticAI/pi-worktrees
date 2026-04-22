@@ -114,8 +114,9 @@ describe('cmdList onSwitch integration', () => {
     // Must NOT include the old terse message.
     expect(notifiedText).not.toMatch(/^No onSwitch configured for: /m);
     // Must describe the current behavior and offer actionable next steps.
-    expect(notifiedText).toMatch(/does not\s+redirect the running pi session/);
+    expect(notifiedText).toContain('No onSwitch hook is configured');
     expect(notifiedText).toContain(`cd ${worktreePath} && pi`);
     expect(notifiedText).toContain('/worktree settings onSwitch');
+    expect(notifiedText).toContain('switchBehavior = "in-place"');
   });
 });

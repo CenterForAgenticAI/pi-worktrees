@@ -170,8 +170,9 @@ path.
 | `worktrees` | `Record<string, WorktreeSettings>` | `{}` | Pattern-matched settings by repo URL or glob. |
 | `worktrees[*].worktreeRoot` | `string` | `{{mainWorktree}}.worktrees` | Parent directory for new worktrees. |
 | `worktrees[*].onCreate` | `string \| string[]` | `echo "Created {{path}}"` | Command(s) run after creating a new worktree. |
-| `worktrees[*].onSwitch` | `string \| string[]` | unset | Command(s) run when switching to an existing worktree via `/worktree list` or when re-selecting in `/worktree create`. |
+| `worktrees[*].onSwitch` | `string \| string[]` | unset | Command(s) run when switching to an existing worktree via `/worktree list` or when re-selecting in `/worktree create`. Whether this runs at all depends on `switchBehavior`. |
 | `worktrees[*].onBeforeRemove` | `string \| string[]` | unset | Command(s) run before `/worktree remove`. A non-zero exit blocks removal. |
+| `worktrees[*].switchBehavior` | `'in-place' \| 'hook-only' \| 'both'` | `in-place` | Controls what `/worktree list` and `/worktree create` (on an existing worktree) do when you pick one. See [`switchBehavior`](#switchbehavior) below. |
 | `matchingStrategy` | `'fail-on-tie' \| 'first-wins' \| 'last-wins'` | `fail-on-tie` | Tie-break behavior for equally specific patterns. |
 | `onCreateDisplayOutputMaxLines` | `number` (integer, `>= 0`) | `5` | Number of latest stdout/stderr lines shown in live UI updates during `onCreate`. |
 | `onCreateCmdDisplayPending` | `string` | `[ ] {{cmd}}` | Template for pending/running command display lines. |
@@ -245,6 +246,41 @@ Where new worktrees are created.
 > Backward compatibility: `parentDir` is still accepted as a deprecated alias for `worktreeRoot`.
 > The extension will migrate existing `parentDir` values to `worktreeRoot` automatically.
 
+### `switchBehavior`
+
+Controls what happens when you select an existing worktree via `/worktree list`
+or re-enter one via `/worktree create`.
+
+- **Default:** `"in-place"`
+- Values: `"in-place"`, `"hook-only"`, `"both"`
+
+| Mode | Session cwd | `onSwitch` runs? |
+|---|---|---|
+| `"in-place"` (default) | Moved into the worktree | No |
+| `"hook-only"` | Unchanged | Yes (if configured) |
+| `"both"` | Moved into the worktree | Yes, inside the replaced session |
+
+**How in-place switching works:** the extension calls
+`SessionManager.forkFrom(currentSessionFile, worktreePath)` to write a new
+session JSONL under the worktree's cwd bucket with the full conversation
+history preserved, then invokes `ctx.switchSession(forkedPath)` so pi tears
+down the current runtime and rebuilds every cwd-bound service (bash, read,
+write, edit, grep, footer, session directory) at the worktree path. On
+**pi >= 0.65.0** this produces a seamless switch; on older pi the session
+switch will succeed but tools may keep their old cwd, so the extension
+treats that case as "unsupported" and falls back to the hook-only path with
+a warning. The original session file is left in place — switching back is
+just another `/worktree list` away.
+
+**When to pick `"hook-only"`:** you already have a tmux/zellij/Terminal
+workflow that spawns a second pi in a new tab or window and you want to
+keep it. Set `onSwitch` to whatever command you already use.
+
+**When to pick `"both"`:** you want an in-place switch *and* a setup hook
+that runs after the session is rebuilt — e.g. `mise run dev:resume`,
+`docker compose up -d`. Avoid putting pi-spawning commands in `onSwitch`
+while using `"both"`; you'll end up with two pi processes.
+
 ### `onSwitch`
 
 Command(s) run when a worktree is re-selected rather than created.
@@ -255,23 +291,25 @@ Triggered by `/worktree list` (selecting an existing worktree) and by
 - Runs with the selected worktree's path as the child process cwd
 - Supports all template variables (`{{path}}`, `{{name}}`, `{{branch}}`, `{{project}}`, `{{mainWorktree}}`)
 - Not configured by default
+- Whether it runs depends on [`switchBehavior`](#switchbehavior) — `"in-place"`
+  skips the hook entirely; `"hook-only"` and `"both"` run it
 
-> **What "switch" does today.** In the current version of this extension,
-> `onSwitch` does **not** change the running pi session's working directory.
-> It is a hook for opening pi (or any other workflow) in the selected
-> worktree — typically a new terminal tab, tmux/zellij pane, or IDE window
-> rooted at `{{path}}`. Without an `onSwitch`, `/worktree list` only prints
-> the path and next-step suggestions. A future release of this extension
-> plans to switch the running session in place on sufficiently recent pi
-> builds; until that lands, the multiplexer / relaunch workflow below is the
-> recommended setup.
->
-> Typical `onSwitch` values:
-> ```
-> zellij action new-tab --cwd {{path}} -- pi
-> tmux new-window -c {{path}} pi
-> osascript -e 'tell app "Terminal" to do script "cd {{path}} && pi"'
-> ```
+Typical `onSwitch` values for `hook-only` workflows (spawn pi in a new pane
+and stay in the current one):
+
+```
+zellij action new-tab --cwd {{path}} -- pi
+tmux new-window -c {{path}} pi
+osascript -e 'tell app "Terminal" to do script "cd {{path}} && pi"'
+```
+
+Typical `onSwitch` values for `both` workflows (post-switch setup, no
+second pi):
+
+```
+mise run dev:resume
+docker compose up -d
+```
 
 ### `onBeforeRemove`
 
@@ -514,23 +552,29 @@ Use `/worktree remove <name>`, then confirm the force remove prompt.
 `/worktree cd` prints the path; it does not directly mutate your shell state.
 
 ### `/worktree list` doesn’t change my pi session’s directory
-The current version of this extension does not move the running pi session
-when you pick a worktree. It runs your `onSwitch` hook (if any) with the
-worktree’s path as the child process’s cwd, and prints the path. To actually
-work in a worktree you have two options today:
 
-- **Start a fresh pi there.** Exit the current session and run
-  `cd /path/to/worktree && pi`. Each cwd keeps its own session history under
-  `~/.pi/agent/sessions/<encoded-cwd>/`.
-- **Configure an `onSwitch` hook that spawns pi in a new tab/window.** See the
-  [`onSwitch`](#onswitch) section above for example commands. Because
-  `onSwitch` children already run rooted at `{{path}}`, a plain `pi` inside
-  the hook resolves correctly.
+The default `switchBehavior` is `"in-place"`, which **does** move the running
+session into the selected worktree on **pi >= 0.65.0** — if it isn't working:
 
-Note: recent pi builds (≥ 0.65.0) expose runtime APIs that make true
-in-place cwd switching possible, and a future release of this extension
-plans to use them so `/worktree list` can redirect the current session
-directly.
+- **Check your pi version.** Run `pi --version`; `switchBehavior: "in-place"`
+  needs **>= 0.65.0** (when cross-cwd session replacement landed). On older
+  pi the extension warns and falls back to `hook-only`.
+- **Your session may not be persistent.** Sessions started with `--no-session`
+  have no JSONL to fork; the extension warns and falls back to `hook-only`.
+- **You may have explicitly set `switchBehavior: "hook-only"`.** Check
+  `/worktree settings switchBehavior` or your config file. Reset with
+  `/worktree settings switchBehavior in-place`.
+- **Your `onSwitch` may be spawning a second pi.** If you used to run
+  `zellij action new-tab --cwd {{path}} -- pi` as your `onSwitch`, switch to
+  `switchBehavior: "in-place"` and clear `onSwitch` — or keep `hook-only` if
+  the multiplexer flow is what you want.
+
+To force the multiplexer / relaunch workflow regardless of pi version, set:
+
+```
+/worktree settings switchBehavior hook-only
+/worktree settings onSwitch 'zellij action new-tab --cwd {{path}} -- pi'
+```
 
 ---
 

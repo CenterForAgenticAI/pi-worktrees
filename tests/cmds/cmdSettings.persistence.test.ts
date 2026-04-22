@@ -151,6 +151,32 @@ describe('cmdSettings persistence', () => {
     expect(fullText).toContain('Config file: /fake/home/.pi/agent/pi-worktrees.config.json');
   });
 
+  it('accepts switchBehavior with a valid value', async () => {
+    const { deps, store } = createFakeDeps();
+    const { ctx, notify } = createCtx();
+
+    await cmdSettings('switchBehavior in-place', ctx as never, deps);
+
+    expect(store.worktrees).toEqual({
+      '**': { switchBehavior: 'in-place' },
+    });
+    const messages = notify.mock.calls.map((call) => String(call[0]));
+    expect(messages).toContain('✓ Set switchBehavior = "in-place"');
+  });
+
+  it('rejects switchBehavior with an invalid value and does not persist', async () => {
+    const { deps } = createFakeDeps();
+    const { ctx, notify } = createCtx();
+
+    await cmdSettings('switchBehavior bogus', ctx as never, deps);
+
+    expect(deps.configService.set).not.toHaveBeenCalled();
+    expect(deps.configService.persist).not.toHaveBeenCalled();
+    const messages = notify.mock.calls.map((call) => String(call[0]));
+    expect(messages.some((m) => m.includes('Invalid switchBehavior: "bogus"'))).toBe(true);
+    expect(messages.some((m) => m.includes('in-place, hook-only, both'))).toBe(true);
+  });
+
   it('treats parentDir as a deprecated alias and migrates to worktreeRoot', async () => {
     const { deps, store } = createFakeDeps();
     const { ctx, notify } = createCtx();

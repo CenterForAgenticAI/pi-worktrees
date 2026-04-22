@@ -1,7 +1,12 @@
 import type { ExtensionCommandContext } from '@mariozechner/pi-coding-agent';
 import type { CommandDeps } from '../types.ts';
 import { saveWorktreeSettings } from '../services/config/config.ts';
-import { WorktreeSettingsConfig, getConfiguredWorktreeRoot } from '../services/config/schema.ts';
+import {
+  DEFAULT_SWITCH_BEHAVIOR,
+  SwitchBehavior,
+  WorktreeSettingsConfig,
+  getConfiguredWorktreeRoot,
+} from '../services/config/schema.ts';
 
 function formatHookValue(value: WorktreeSettingsConfig['onCreate']): string {
   if (!value) {
@@ -37,6 +42,7 @@ export async function cmdInit(
     currentSettings.branchNameGenerator
       ? `  branchNameGenerator: ${currentSettings.branchNameGenerator}`
       : null,
+    currentSettings.switchBehavior ? `  switchBehavior: ${currentSettings.switchBehavior}` : null,
   ].filter(Boolean) as string[];
 
   if (currentLines.length > 1) {
@@ -123,6 +129,29 @@ export async function cmdInit(
     return;
   }
 
+  const SWITCH_IN_PLACE =
+    'in-place (move this pi session into the selected worktree; requires pi >= 0.65.0)';
+  const SWITCH_HOOK_ONLY = 'hook-only (just run onSwitch, leave this pi session where it is)';
+  const SWITCH_BOTH = 'both (switch in place AND run onSwitch after)';
+
+  const switchOptionByLabel = new Map<string, SwitchBehavior>([
+    [SWITCH_IN_PLACE, 'in-place'],
+    [SWITCH_HOOK_ONLY, 'hook-only'],
+    [SWITCH_BOTH, 'both'],
+  ]);
+
+  const switchChoice = await ctx.ui.select(
+    `When selecting an existing worktree via /worktree list, what should happen? (default: ${DEFAULT_SWITCH_BEHAVIOR})`,
+    Array.from(switchOptionByLabel.keys())
+  );
+
+  if (switchChoice === undefined) {
+    ctx.ui.notify('Setup cancelled', 'info');
+    return;
+  }
+
+  const switchBehavior = switchOptionByLabel.get(switchChoice) ?? DEFAULT_SWITCH_BEHAVIOR;
+
   const newSettings: WorktreeSettingsConfig = {};
   const clearKeys: (keyof WorktreeSettingsConfig)[] = [];
 
@@ -153,6 +182,14 @@ export async function cmdInit(
     clearKeys.push('onBeforeRemove');
   }
 
+  if (switchBehavior !== DEFAULT_SWITCH_BEHAVIOR) {
+    newSettings.switchBehavior = switchBehavior;
+  } else {
+    // Writing the default is fine too, but keeping it out of the config file
+    // keeps user settings tidy and makes future default changes easier.
+    clearKeys.push('switchBehavior');
+  }
+
   const preview = [
     'Settings to save:',
     '',
@@ -164,6 +201,9 @@ export async function cmdInit(
     newSettings.onBeforeRemove
       ? `  onBeforeRemove: "${newSettings.onBeforeRemove}"`
       : '  onBeforeRemove: (none)',
+    `  switchBehavior:  ${switchBehavior}${
+      switchBehavior === DEFAULT_SWITCH_BEHAVIOR ? ' (default; unset in file)' : ''
+    }`,
     '',
     `Target file: ${deps.configService.getConfigPath('home')}`,
     '',

@@ -28,7 +28,7 @@ Commands:
   /worktree settings [key] [val]   Get/set individual settings
   /worktree create <branch> [--name <worktree-name>]  Create new worktree from branch
   /worktree create --generate [--name <worktree-name>] <prompt-or-name>  Generate branch via config command
-  /worktree list                   List worktrees and run onSwitch for a selection
+  /worktree list                   List worktrees and switch into a selection
   /worktree remove <name>          Remove a worktree (runs onBeforeRemove if set)
   /worktree status                 Show current worktree info
   /worktree cd <name>              Print path to worktree
@@ -81,6 +81,12 @@ Migration note: legacy '/worktree create <feature-name>' is deprecated and now t
 Use '/worktree create feature/<name> --name <name>' to preserve old semantics.
 Hook vars: {{path}}, {{name}}, {{branch}}, {{project}}, {{mainWorktree}}
 Hooks: onCreate (new), onSwitch (existing), onBeforeRemove (pre-delete, non-zero blocks)
+switchBehavior: in-place (default) | hook-only | both
+  in-place: forks the current session into the worktree's cwd bucket and asks
+            pi to switch into it, so bash/read/write/edit all rebind to the
+            new cwd. Requires pi >= 0.65.0 for correct cross-cwd rebinding.
+  hook-only: legacy behavior; runs onSwitch and leaves this pi session alone.
+  both: switch in place, then run onSwitch inside the replaced session.
 Logfile vars: {sessionId} / {{sessionId}}, {name} / {{name}}, {timestamp} / {{timestamp}}
 `.trim();
 

@@ -15,7 +15,13 @@ import {
   getWorktreeParentDir,
   matchRepo,
 } from '../git.ts';
-import { PiWorktreeConfig, PiWorktreeConfigSchema, WorktreeSettingsConfig } from './schema.ts';
+import {
+  DEFAULT_SWITCH_BEHAVIOR,
+  PiWorktreeConfig,
+  PiWorktreeConfigSchema,
+  SwitchBehavior,
+  WorktreeSettingsConfig,
+} from './schema.ts';
 
 const DEFAULT_LOGFILE_TEMPLATE = '/tmp/pi-worktree-{sessionId}-{name}.log';
 const DEFAULT_ONCREATE_DISPLAY_OUTPUT_MAX_LINES = 5;
@@ -129,6 +135,7 @@ export async function createPiWorktreeConfigService() {
 
     return {
       ...settings,
+      switchBehavior: (settings.switchBehavior ?? DEFAULT_SWITCH_BEHAVIOR) as SwitchBehavior,
       repo,
       project,
       mainWorktree,

@@ -1,5 +1,18 @@
 import { appendFileSync, writeFileSync } from 'fs';
 import { spawn } from 'child_process';
+import { resolve as resolvePath } from 'path';
+import type { ExtensionCommandContext } from '@mariozechner/pi-coding-agent';
+import { SessionManager } from '@mariozechner/pi-coding-agent';
+
+// `ReplacedSessionContext` is exported from
+// `@mariozechner/pi-coding-agent/dist/core/extensions/index.js` but not from
+// the package's top-level entrypoint (only `.` and `./hooks` are in the
+// package `exports` map, as of pi 0.69.0). We recover the type by reflecting
+// on the `switchSession` method's `withSession` callback parameter so we
+// don't have to maintain a parallel structural copy.
+type SwitchSessionOptions = NonNullable<Parameters<ExtensionCommandContext['switchSession']>[1]>;
+type WithSessionCallback = NonNullable<SwitchSessionOptions['withSession']>;
+export type ReplacedSessionContext = Parameters<WithSessionCallback>[0];
 import { expandTemplate } from '../services/templates.ts';
 import type { WorktreeCreatedContext } from '../types.ts';
 import { WorktreeSettingsConfig } from '../services/config/schema.ts';
@@ -40,6 +53,99 @@ export interface OnCreateHookOptions {
 }
 export function sanitizePathPart(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, '-');
+}
+
+/**
+ * Outcome of `attemptInPlaceSwitch`. `switched` is the happy path; anything
+ * else lets the caller fall back to the hook-only flow.
+ */
+export type InPlaceSwitchResult =
+  | { status: 'switched'; forkedSessionFile: string }
+  | { status: 'already-here' }
+  | {
+      status: 'unsupported';
+      reason:
+        | 'no-switch-api'
+        | 'no-session-file'
+        | 'fork-failed'
+        | 'switch-cancelled'
+        | 'switch-failed';
+      error?: Error;
+    };
+
+/**
+ * Fork the current session into the target cwd's bucket and ask pi to switch
+ * into it. On pi >= 0.65.0 this rebuilds every cwd-bound service (bash/read/
+ * write/edit/grep tools, footer, session dir) to point at `target.path`; on
+ * older pi the switch may succeed but tools will keep their old cwd, which
+ * the caller should surface to the user.
+ *
+ * The helper is intentionally conservative: it never mutates the source
+ * session file and returns a structured outcome instead of throwing so the
+ * caller can fall back to hook-only messaging when the switch isn't viable.
+ */
+export async function attemptInPlaceSwitch(
+  ctx: ExtensionCommandContext,
+  target: { path: string },
+  options?: {
+    /**
+     * Invoked post-switch with a `ReplacedSessionContext` bound to the new
+     * session. Use this (not the outer `ctx`) for any work that should see
+     * the new cwd — e.g. running an onSwitch hook in "both" mode.
+     */
+    withSession?: WithSessionCallback;
+  }
+): Promise<InPlaceSwitchResult> {
+  const targetPath = resolvePath(target.path);
+
+  if (resolvePath(ctx.cwd) === targetPath) {
+    return { status: 'already-here' };
+  }
+
+  if (typeof ctx.switchSession !== 'function') {
+    return { status: 'unsupported', reason: 'no-switch-api' };
+  }
+
+  const sourceSessionFile = ctx.sessionManager?.getSessionFile?.();
+  if (!sourceSessionFile) {
+    return { status: 'unsupported', reason: 'no-session-file' };
+  }
+
+  let forkedSessionFile: string;
+  try {
+    const forked = SessionManager.forkFrom(sourceSessionFile, targetPath);
+    const filePath = forked.getSessionFile();
+    if (!filePath) {
+      return {
+        status: 'unsupported',
+        reason: 'fork-failed',
+        error: new Error('forkFrom() returned a SessionManager with no session file'),
+      };
+    }
+    forkedSessionFile = filePath;
+  } catch (err) {
+    return {
+      status: 'unsupported',
+      reason: 'fork-failed',
+      error: err instanceof Error ? err : new Error(String(err)),
+    };
+  }
+
+  try {
+    const result = await ctx.switchSession(forkedSessionFile, {
+      withSession: options?.withSession,
+    });
+    if (result.cancelled) {
+      return { status: 'unsupported', reason: 'switch-cancelled' };
+    }
+    return { status: 'switched', forkedSessionFile };
+  } catch (err) {
+    return {
+      status: 'unsupported',
+      reason: 'switch-failed',
+      error: err instanceof Error ? err : new Error(String(err)),
+    };
+  }
 }
 
 export function resolveLogfilePath(

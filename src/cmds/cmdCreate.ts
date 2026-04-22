@@ -1,7 +1,14 @@
 import type { ExtensionCommandContext } from '@mariozechner/pi-coding-agent';
 import { basename, join } from 'path';
 import { ensureExcluded, git, isGitRepo, listWorktrees } from '../services/git.ts';
-import { resolveLogfilePath, runHook, runOnCreateHook, sanitizePathPart } from './shared.ts';
+import type { OnCreateHookOptions, ReplacedSessionContext } from './shared.ts';
+import {
+  attemptInPlaceSwitch,
+  resolveLogfilePath,
+  runHook,
+  runOnCreateHook,
+  sanitizePathPart,
+} from './shared.ts';
 import type { CommandDeps, WorktreeCreatedContext } from '../types.ts';
 import { DefaultLogfileTemplate } from '../services/config/config.ts';
 import { parseCreateCommandArgs } from './createArgs.ts';
@@ -63,76 +70,7 @@ export async function cmdCreate(
       worktree.branch === branchName
   );
   if (existingWorktree) {
-    if (!ctx.hasUI) {
-      ctx.ui.notify(`Worktree already exists at: ${worktreePath}`, 'error');
-      return;
-    }
-
-    const confirmMessage = current.onSwitch
-      ? `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nRun onSwitch for this worktree?`
-      : `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nShow this worktree's path? (This version of the extension does not redirect the running pi session; configure an onSwitch hook to open pi in this worktree automatically.)`;
-    const shouldSwitch = await ctx.ui.confirm('Worktree already exists', confirmMessage);
-
-    if (!shouldSwitch) {
-      ctx.ui.notify('Cancelled', 'info');
-      return;
-    }
-
-    const existingCtx: WorktreeCreatedContext = {
-      path: existingWorktree.path,
-      name: basename(existingWorktree.path),
-      branch: existingWorktree.branch,
-      ...current,
-    };
-
-    const sessionId = sanitizePathPart(ctx.sessionManager?.getSessionId?.() || 'session');
-    const safeName = sanitizePathPart(existingCtx.name);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const logPath = resolveLogfilePath(current.logfile ?? DefaultLogfileTemplate, {
-      sessionId,
-      name: safeName,
-      timestamp,
-    });
-
-    const result = await runHook(
-      existingCtx,
-      current.onSwitch,
-      'onSwitch',
-      ctx.ui.notify.bind(ctx.ui),
-      {
-        logPath,
-        displayOutputMaxLines: current.onCreateDisplayOutputMaxLines,
-        cmdDisplayPending: current.onCreateCmdDisplayPending,
-        cmdDisplaySuccess: current.onCreateCmdDisplaySuccess,
-        cmdDisplayError: current.onCreateCmdDisplayError,
-        cmdDisplayPendingColor: current.onCreateCmdDisplayPendingColor,
-        cmdDisplaySuccessColor: current.onCreateCmdDisplaySuccessColor,
-        cmdDisplayErrorColor: current.onCreateCmdDisplayErrorColor,
-      }
-    );
-
-    if (!result.success) {
-      ctx.ui.notify('onSwitch failed', 'error');
-      return;
-    }
-    ctx.ui.notify(`Worktree path: ${existingWorktree.path}`, 'info');
-    if (current.onSwitch) {
-      ctx.ui.notify(
-        `onSwitch finished. Note: this pi session has not been moved to ${existingWorktree.path} — in this version of the extension, onSwitch is expected to have opened pi there in a separate tab/window/pane.`,
-        'info'
-      );
-    } else {
-      ctx.ui.notify(
-        [
-          'Note: in this version of the extension, /worktree create does not',
-          'redirect the running pi session to the selected worktree.',
-          'To work in this worktree, either:',
-          `  • exit and run: cd ${existingWorktree.path} && pi`,
-          '  • configure /worktree settings onSwitch "<command that spawns pi in a new tab/window>"',
-        ].join('\n'),
-        'info'
-      );
-    }
+    await handleExistingWorktree(ctx, deps, current, existingWorktree);
     return;
   }
 
@@ -183,4 +121,162 @@ export async function cmdCreate(
     cmdDisplaySuccessColor: current.onCreateCmdDisplaySuccessColor,
     cmdDisplayErrorColor: current.onCreateCmdDisplayErrorColor,
   });
+}
+
+function describeUnsupported(reason: string): string {
+  switch (reason) {
+    case 'no-switch-api':
+      return 'pi is too old to switch sessions in place (requires pi >= 0.51.1, and >= 0.65.0 for correct cross-cwd tool rebinding)';
+    case 'no-session-file':
+      return 'the current session has no persistent file (started with --no-session?)';
+    case 'fork-failed':
+      return 'forking the session file into the worktree failed';
+    case 'switch-cancelled':
+      return 'another extension cancelled the session switch';
+    case 'switch-failed':
+      return 'pi returned an error while switching the session';
+    default:
+      return reason;
+  }
+}
+
+async function handleExistingWorktree(
+  ctx: ExtensionCommandContext,
+  deps: CommandDeps,
+  current: ReturnType<CommandDeps['configService']['current']>,
+  existingWorktree: { path: string; branch: string }
+): Promise<void> {
+  if (!ctx.hasUI) {
+    ctx.ui.notify(`Worktree already exists at: ${existingWorktree.path}`, 'error');
+    return;
+  }
+
+  const wantsSwitch = current.switchBehavior === 'in-place' || current.switchBehavior === 'both';
+  const wantsHook = current.switchBehavior === 'hook-only' || current.switchBehavior === 'both';
+
+  const confirmMessage = wantsSwitch
+    ? `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nSwitch this pi session into the worktree?${
+        wantsHook ? ' (onSwitch will run after the switch.)' : ''
+      }`
+    : current.onSwitch
+      ? `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nRun onSwitch for this worktree?`
+      : `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nShow this worktree's path?`;
+
+  const shouldProceed = await ctx.ui.confirm('Worktree already exists', confirmMessage);
+
+  if (!shouldProceed) {
+    ctx.ui.notify('Cancelled', 'info');
+    return;
+  }
+
+  const existingCtx: WorktreeCreatedContext = {
+    path: existingWorktree.path,
+    name: basename(existingWorktree.path),
+    branch: existingWorktree.branch,
+    project: current.project,
+    mainWorktree: current.mainWorktree,
+  };
+
+  const sessionId = sanitizePathPart(ctx.sessionManager?.getSessionId?.() || 'session');
+  const safeName = sanitizePathPart(existingCtx.name);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const logPath = resolveLogfilePath(current.logfile ?? DefaultLogfileTemplate, {
+    sessionId,
+    name: safeName,
+    timestamp,
+  });
+
+  const hookOptions: OnCreateHookOptions = {
+    logPath,
+    displayOutputMaxLines: current.onCreateDisplayOutputMaxLines,
+    cmdDisplayPending: current.onCreateCmdDisplayPending,
+    cmdDisplaySuccess: current.onCreateCmdDisplaySuccess,
+    cmdDisplayError: current.onCreateCmdDisplayError,
+    cmdDisplayPendingColor: current.onCreateCmdDisplayPendingColor,
+    cmdDisplaySuccessColor: current.onCreateCmdDisplaySuccessColor,
+    cmdDisplayErrorColor: current.onCreateCmdDisplayErrorColor,
+  };
+
+  const runOnSwitchHook = async (
+    // eslint-disable-next-line no-unused-vars
+    notify: (msg: string, type: 'info' | 'error' | 'warning') => void
+  ): Promise<boolean> => {
+    if (!current.onSwitch) {
+      return true;
+    }
+    const result = await runHook(existingCtx, current.onSwitch, 'onSwitch', notify, hookOptions);
+    if (!result.success) {
+      notify('onSwitch failed', 'error');
+      return false;
+    }
+    return true;
+  };
+
+  if (wantsSwitch) {
+    ctx.ui.notify(
+      `Switching session to ${existingWorktree.branch} (${existingWorktree.path})...`,
+      'info'
+    );
+
+    const switchResult = await attemptInPlaceSwitch(ctx, existingWorktree, {
+      withSession: async (newCtx: ReplacedSessionContext) => {
+        newCtx.ui.notify(
+          `✓ Switched. This pi session is now working in ${existingWorktree.path}. Session history was preserved.`,
+          'info'
+        );
+        if (wantsHook) {
+          await runOnSwitchHook(newCtx.ui.notify.bind(newCtx.ui));
+        }
+      },
+    });
+
+    if (switchResult.status === 'switched') {
+      return;
+    }
+
+    if (switchResult.status === 'already-here') {
+      ctx.ui.notify(`Already working in ${existingWorktree.path}.`, 'info');
+      if (wantsHook) {
+        await runOnSwitchHook(ctx.ui.notify.bind(ctx.ui));
+      }
+      return;
+    }
+
+    ctx.ui.notify(
+      `Couldn't switch the session in place: ${describeUnsupported(switchResult.reason)}. Falling back to onSwitch.`,
+      'warning'
+    );
+    if (switchResult.error) {
+      ctx.ui.notify(switchResult.error.message, 'error');
+    }
+  }
+
+  if (!current.onSwitch) {
+    ctx.ui.notify(
+      [
+        `Worktree path: ${existingWorktree.path}`,
+        `Branch:        ${existingWorktree.branch}`,
+        '',
+        'No onSwitch hook is configured and in-place switching is not',
+        'available in this context. To work in this worktree, either:',
+        `  • exit and run: cd ${existingWorktree.path} && pi`,
+        '  • configure /worktree settings onSwitch "<command that spawns pi in a new tab/window>"',
+        '  • (on pi >= 0.65.0) set switchBehavior = "in-place" to move this',
+        '    session into the worktree directly:',
+        '      /worktree settings switchBehavior in-place',
+      ].join('\n'),
+      'info'
+    );
+    return;
+  }
+
+  const ok = await runOnSwitchHook(ctx.ui.notify.bind(ctx.ui));
+  if (!ok) {
+    return;
+  }
+  ctx.ui.notify(`Worktree path: ${existingWorktree.path}`, 'info');
+  ctx.ui.notify(
+    `onSwitch finished. Note: this pi session has not been moved to ${existingWorktree.path} — in hook-only mode, onSwitch is expected to have opened pi there in a separate tab/window/pane. To move this session in place instead, set switchBehavior = "in-place".`,
+    'info'
+  );
 }

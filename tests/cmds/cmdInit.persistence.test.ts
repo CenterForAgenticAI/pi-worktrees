@@ -46,17 +46,19 @@ function createFakeDeps(initial: FakeStore['worktrees'] = {}): {
 
 function createFakeCtx(scripted: {
   select?: unknown;
+  selects?: unknown[];
   inputs?: (string | undefined)[];
   confirm?: boolean;
 }) {
   const notify = vi.fn();
   const inputs = [...(scripted.inputs ?? [])];
+  const selects = [...(scripted.selects ?? [])];
   const ctx = {
     cwd: '/repo',
     hasUI: true,
     ui: {
       notify,
-      select: vi.fn(async () => scripted.select),
+      select: vi.fn(async () => (selects.length > 0 ? selects.shift() : scripted.select)),
       input: vi.fn(async () => inputs.shift()),
       confirm: vi.fn(async () => scripted.confirm ?? true),
     },
@@ -132,6 +134,48 @@ describe('cmdInit persistence', () => {
 
     expect(deps.configService.set).not.toHaveBeenCalled();
     expect(deps.configService.persist).not.toHaveBeenCalled();
+  });
+
+  it('persists a non-default switchBehavior selection', async () => {
+    const { deps } = createFakeDeps();
+    const { ctx } = createFakeCtx({
+      selects: [
+        'Default ({{mainWorktree}}.worktrees)',
+        'hook-only (just run onSwitch, leave this pi session where it is)',
+      ],
+      inputs: ['make setup', '', ''],
+      confirm: true,
+    });
+
+    await cmdInit('', ctx as never, deps);
+
+    expect(deps.configService.set).toHaveBeenCalledWith(
+      'worktrees',
+      {
+        '**': {
+          onCreate: 'make setup',
+          switchBehavior: 'hook-only',
+        },
+      },
+      'home'
+    );
+  });
+
+  it('does not write switchBehavior when the user keeps the default', async () => {
+    const { deps } = createFakeDeps();
+    const { ctx } = createFakeCtx({
+      selects: [
+        'Default ({{mainWorktree}}.worktrees)',
+        'in-place (move this pi session into the selected worktree; requires pi >= 0.65.0)',
+      ],
+      inputs: ['make setup', '', ''],
+      confirm: true,
+    });
+
+    await cmdInit('', ctx as never, deps);
+
+    const [, value] = (deps.configService.set as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(value['**']).not.toHaveProperty('switchBehavior');
   });
 
   it('clears previously-set hooks when the user empties the prompt', async () => {

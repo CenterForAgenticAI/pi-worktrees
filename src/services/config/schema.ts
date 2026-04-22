@@ -12,6 +12,8 @@ import {
 
 const HookCommandsSchema = Union([TypeString(), TypeArray(TypeString())]);
 
+const SwitchBehaviorSchema = Union([Literal('in-place'), Literal('hook-only'), Literal('both')]);
+
 const WorktreeSettingsSchema = TypeObject(
   {
     worktreeRoot: Optional(TypeString()),
@@ -20,12 +22,15 @@ const WorktreeSettingsSchema = TypeObject(
     onSwitch: Optional(HookCommandsSchema),
     onBeforeRemove: Optional(HookCommandsSchema),
     branchNameGenerator: Optional(TypeString()),
+    switchBehavior: Optional(SwitchBehaviorSchema),
   },
   {
     $id: 'WorktreeSettingsConfig',
     additionalProperties: false,
   }
 );
+
+export const DEFAULT_SWITCH_BEHAVIOR: SwitchBehavior = 'in-place';
 
 const MatchingStrategySchema = Union([
   Literal('fail-on-tie'),
@@ -66,6 +71,7 @@ export const PiWorktreeConfigSchema = TypeObject(
 );
 
 export type WorktreeSettingsConfig = Static<typeof WorktreeSettingsSchema>;
+export type SwitchBehavior = Static<typeof SwitchBehaviorSchema>;
 export type MatchingStrategy = Static<typeof MatchingStrategySchema>;
 export type MatchingStrategyResult = Static<typeof MatchStrategyResultSchema>;
 export type PiWorktreeConfig = Static<typeof PiWorktreeConfigSchema>;

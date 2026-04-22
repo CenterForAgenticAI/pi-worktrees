@@ -1,7 +1,12 @@
 import type { ExtensionCommandContext } from '@mariozechner/pi-coding-agent';
 import type { CommandDeps } from '../types.ts';
 import { saveWorktreeSettings } from '../services/config/config.ts';
-import { WorktreeSettingsConfig, getConfiguredWorktreeRoot } from '../services/config/schema.ts';
+import {
+  DEFAULT_SWITCH_BEHAVIOR,
+  SwitchBehavior,
+  WorktreeSettingsConfig,
+  getConfiguredWorktreeRoot,
+} from '../services/config/schema.ts';
 
 const VALID_SETTING_KEYS = [
   'worktreeRoot',
@@ -10,9 +15,16 @@ const VALID_SETTING_KEYS = [
   'onSwitch',
   'onBeforeRemove',
   'branchNameGenerator',
+  'switchBehavior',
 ] as const;
 type SettingKey = (typeof VALID_SETTING_KEYS)[number];
 type ResolvedKey = Exclude<SettingKey, 'parentDir'>;
+
+const VALID_SWITCH_BEHAVIORS: readonly SwitchBehavior[] = ['in-place', 'hook-only', 'both'];
+
+function isSwitchBehavior(value: string): value is SwitchBehavior {
+  return (VALID_SWITCH_BEHAVIORS as readonly string[]).includes(value);
+}
 
 function formatHookValue(value: WorktreeSettingsConfig['onCreate']): string {
   if (!value) {
@@ -48,6 +60,7 @@ export async function cmdSettings(
       `onSwitch:            ${formatHookValue(currentSettings.onSwitch)}`,
       `onBeforeRemove:      ${formatHookValue(currentSettings.onBeforeRemove)}`,
       `branchNameGenerator: ${currentSettings.branchNameGenerator ?? '(none)'}`,
+      `switchBehavior:      ${currentSettings.switchBehavior ?? `(default: ${DEFAULT_SWITCH_BEHAVIOR})`}`,
       '',
       `Config file: ${deps.configService.getConfigPath('home')}`,
       '',
@@ -102,7 +115,18 @@ export async function cmdSettings(
     }
     confirmationMessage = `✓ Cleared ${resolvedKey}`;
   } else {
-    setFields[resolvedKey] = value;
+    if (resolvedKey === 'switchBehavior') {
+      if (!isSwitchBehavior(value)) {
+        ctx.ui.notify(
+          `Invalid switchBehavior: "${value}"\nValid values: ${VALID_SWITCH_BEHAVIORS.join(', ')}`,
+          'error'
+        );
+        return;
+      }
+      setFields.switchBehavior = value;
+    } else {
+      setFields[resolvedKey] = value;
+    }
     if (resolvedKey === 'worktreeRoot') {
       clearKeys.push('parentDir');
     }
