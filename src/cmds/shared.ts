@@ -1,8 +1,20 @@
-import { appendFileSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, unlinkSync, writeFileSync } from 'fs';
 import { spawn } from 'child_process';
+import { realpathSync } from 'fs';
 import { resolve as resolvePath } from 'path';
 import type { ExtensionCommandContext } from '@mariozechner/pi-coding-agent';
+import * as pi from '@mariozechner/pi-coding-agent';
 import { SessionManager } from '@mariozechner/pi-coding-agent';
+
+// Feature-detect cross-cwd session replacement support.
+// `createAgentSessionRuntime` was introduced in pi 0.65.0 alongside the
+// `AgentSessionRuntime` runtime that rebuilds every cwd-bound service
+// (bash/read/write/edit/grep tools, footer, session dir) when the target
+// session has a different cwd. On pi 0.51.1–0.64.x `ctx.switchSession`
+// exists but the rebuild is not guaranteed, which would leave us with a
+// half-switched session (history moved, tools still in the old cwd).
+const SUPPORTS_CROSS_CWD_SWITCH =
+  typeof (pi as { createAgentSessionRuntime?: unknown }).createAgentSessionRuntime === 'function';
 
 // `ReplacedSessionContext` is exported from
 // `@mariozechner/pi-coding-agent/dist/core/extensions/index.js` but not from
@@ -55,23 +67,69 @@ export function sanitizePathPart(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, '-');
 }
 
+export type InPlaceSwitchUnsupportedReason =
+  | 'no-switch-api'
+  | 'no-session-file'
+  | 'fork-failed'
+  | 'switch-cancelled'
+  | 'switch-failed';
+
 /**
- * Outcome of `attemptInPlaceSwitch`. `switched` is the happy path; anything
- * else lets the caller fall back to the hook-only flow.
+ * Outcome of `attemptInPlaceSwitch`.
+ *
+ * - `switched`: pi has torn down the old runtime and rebuilt at the worktree
+ *   path. The OUTER `ctx` the caller passed in is now stale; only the
+ *   `ReplacedSessionContext` handed to `withSession` is safe to use. If
+ *   `postSwitchError` is set, pi rebuilt the runtime but a downstream step
+ *   (rebindSession or the user-supplied withSession callback) threw.
+ * - `already-here`: the caller's `ctx.cwd` already resolves to `target.path`,
+ *   no switch attempted.
+ * - `unsupported`: nothing was committed to disk that the helper hasn't
+ *   already cleaned up; the outer `ctx` is still safe to use for fallback
+ *   messaging or running an alternate hook.
  */
 export type InPlaceSwitchResult =
-  | { status: 'switched'; forkedSessionFile: string }
+  | { status: 'switched'; forkedSessionFile: string; postSwitchError?: Error }
   | { status: 'already-here' }
   | {
       status: 'unsupported';
-      reason:
-        | 'no-switch-api'
-        | 'no-session-file'
-        | 'fork-failed'
-        | 'switch-cancelled'
-        | 'switch-failed';
+      reason: InPlaceSwitchUnsupportedReason;
       error?: Error;
     };
+
+/** Human-friendly explanation for an `unsupported` reason. */
+export function describeUnsupportedSwitch(reason: InPlaceSwitchUnsupportedReason): string {
+  switch (reason) {
+    case 'no-switch-api':
+      return "pi is too old to switch sessions in place (this extension's peerDep requires pi >= 0.65.0)";
+    case 'no-session-file':
+      return 'the current session has no persistent file (started with --no-session?)';
+    case 'fork-failed':
+      return 'forking the session file into the worktree failed';
+    case 'switch-cancelled':
+      return 'another extension cancelled the session switch';
+    case 'switch-failed':
+      return 'pi returned an error before the new session was activated';
+  }
+}
+
+function tryRealpath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+function tryCleanupSessionFile(path: string): void {
+  try {
+    if (existsSync(path)) {
+      unlinkSync(path);
+    }
+  } catch {
+    // best-effort cleanup; the orphan is harmless beyond bucket noise
+  }
+}
 
 /**
  * Fork the current session into the target cwd's bucket and ask pi to switch
@@ -97,12 +155,16 @@ export async function attemptInPlaceSwitch(
   }
 ): Promise<InPlaceSwitchResult> {
   const targetPath = resolvePath(target.path);
+  const cwdPath = resolvePath(ctx.cwd);
 
-  if (resolvePath(ctx.cwd) === targetPath) {
+  // Path-equality check, with a realpath fallback so symlinked worktree
+  // paths still detect "already here". `realpath` is best-effort — missing
+  // paths or permission errors silently fall back to lexical comparison.
+  if (cwdPath === targetPath || tryRealpath(cwdPath) === tryRealpath(targetPath)) {
     return { status: 'already-here' };
   }
 
-  if (typeof ctx.switchSession !== 'function') {
+  if (typeof ctx.switchSession !== 'function' || !SUPPORTS_CROSS_CWD_SWITCH) {
     return { status: 'unsupported', reason: 'no-switch-api' };
   }
 
@@ -131,20 +193,55 @@ export async function attemptInPlaceSwitch(
     };
   }
 
+  // `withSessionRan` distinguishes "switch failed before pi rebuilt the
+  // runtime" from "runtime was rebuilt and a downstream step threw". If we
+  // got into withSession at all, pi has already replaced the live session
+  // and the OUTER ctx must not be used for recovery.
+  let withSessionRan = false;
+  let userCallbackError: Error | undefined;
+
   try {
     const result = await ctx.switchSession(forkedSessionFile, {
-      withSession: options?.withSession,
+      withSession: async (newCtx) => {
+        withSessionRan = true;
+        if (!options?.withSession) {
+          return;
+        }
+        try {
+          await options.withSession(newCtx);
+        } catch (err) {
+          // The switch is committed; if the caller's callback throws we
+          // record it but do not let it propagate — otherwise the outer
+          // `ctx.switchSession` rejects and the helper would misclassify
+          // a successful switch as `switch-failed`.
+          userCallbackError = err instanceof Error ? err : new Error(String(err));
+        }
+      },
     });
+
     if (result.cancelled) {
+      // emitBeforeSwitch cancelled BEFORE teardown. Forked file is now an
+      // orphan in the target cwd's session bucket.
+      tryCleanupSessionFile(forkedSessionFile);
       return { status: 'unsupported', reason: 'switch-cancelled' };
     }
-    return { status: 'switched', forkedSessionFile };
+
+    return userCallbackError
+      ? { status: 'switched', forkedSessionFile, postSwitchError: userCallbackError }
+      : { status: 'switched', forkedSessionFile };
   } catch (err) {
-    return {
-      status: 'unsupported',
-      reason: 'switch-failed',
-      error: err instanceof Error ? err : new Error(String(err)),
-    };
+    const error = err instanceof Error ? err : new Error(String(err));
+    if (withSessionRan) {
+      // Switch was committed before this error fired (rebindSession or
+      // similar). Do NOT clean up the forked file — it is the active
+      // session now — and report `switched` so callers don't try to
+      // recover with a stale ctx.
+      return { status: 'switched', forkedSessionFile, postSwitchError: error };
+    }
+    // Pre-replacement failure. Clean up the orphan and let the caller fall
+    // back to hook-only with the original ctx.
+    tryCleanupSessionFile(forkedSessionFile);
+    return { status: 'unsupported', reason: 'switch-failed', error };
   }
 }
 

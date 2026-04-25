@@ -129,10 +129,9 @@ export async function cmdInit(
     return;
   }
 
-  const SWITCH_IN_PLACE =
-    'in-place (move this pi session into the selected worktree; requires pi >= 0.65.0)';
-  const SWITCH_HOOK_ONLY = 'hook-only (just run onSwitch, leave this pi session where it is)';
-  const SWITCH_BOTH = 'both (switch in place AND run onSwitch after)';
+  const SWITCH_IN_PLACE = 'in-place — move this pi session into the worktree';
+  const SWITCH_HOOK_ONLY = 'hook-only — just run onSwitch, leave this session in main';
+  const SWITCH_BOTH = 'both — move the session AND run onSwitch after';
 
   const switchOptionByLabel = new Map<string, SwitchBehavior>([
     [SWITCH_IN_PLACE, 'in-place'],
@@ -141,7 +140,7 @@ export async function cmdInit(
   ]);
 
   const switchChoice = await ctx.ui.select(
-    `When selecting an existing worktree via /worktree list, what should happen? (default: ${DEFAULT_SWITCH_BEHAVIOR})`,
+    `When you pick an existing worktree (default: ${DEFAULT_SWITCH_BEHAVIOR}):`,
     Array.from(switchOptionByLabel.keys())
   );
 

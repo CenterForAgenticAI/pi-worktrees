@@ -3,7 +3,13 @@ import { DefaultLogfileTemplate } from '../services/config/config.ts';
 import { isGitRepo, listWorktrees, type WorktreeInfo } from '../services/git.ts';
 import type { CmdHandler, WorktreeCreatedContext } from '../types.ts';
 import type { OnCreateHookOptions, ReplacedSessionContext } from './shared.ts';
-import { attemptInPlaceSwitch, resolveLogfilePath, runHook, sanitizePathPart } from './shared.ts';
+import {
+  attemptInPlaceSwitch,
+  describeUnsupportedSwitch,
+  resolveLogfilePath,
+  runHook,
+  sanitizePathPart,
+} from './shared.ts';
 
 function formatWorktreeOption(worktree: WorktreeInfo): string {
   const markers = [worktree.isMain ? '[main]' : '', worktree.isCurrent ? '[current]' : '']
@@ -11,23 +17,6 @@ function formatWorktreeOption(worktree: WorktreeInfo): string {
     .join(' ');
 
   return `${worktree.branch}${markers ? ' ' + markers : ''}\n  ${worktree.path}`;
-}
-
-function describeUnsupported(reason: string): string {
-  switch (reason) {
-    case 'no-switch-api':
-      return 'pi is too old to switch sessions in place (requires pi >= 0.51.1, and >= 0.65.0 for correct cross-cwd tool rebinding)';
-    case 'no-session-file':
-      return 'the current session has no persistent file (started with --no-session?)';
-    case 'fork-failed':
-      return 'forking the session file into the worktree failed';
-    case 'switch-cancelled':
-      return 'another extension cancelled the session switch';
-    case 'switch-failed':
-      return 'pi returned an error while switching the session';
-    default:
-      return reason;
-  }
 }
 
 function buildHookOptions(
@@ -169,7 +158,10 @@ export const cmdList: CmdHandler = async (_args, ctx, deps) => {
     }
 
     if (switchResult.status === 'already-here') {
-      ctx.ui.notify(`Already working in ${target.path}.`, 'info');
+      ctx.ui.notify(
+        `This pi session is already rooted at ${target.path}. No switch needed.`,
+        'info'
+      );
       if (wantsHook) {
         const stopBusy = deps.statusService.busy(ctx, `Running onSwitch for ${target.branch}...`);
         const ok = await runOnSwitchHook(ctx.ui.notify.bind(ctx.ui));
@@ -185,10 +177,9 @@ export const cmdList: CmdHandler = async (_args, ctx, deps) => {
 
     // switchResult.status === 'unsupported' — fall through to hook-only with
     // a warning that explains why. `ctx` is still live because no session
-    // replacement took effect.
-    const reason = switchResult.reason;
+    // replacement took effect (the helper cleans up any orphan fork).
     ctx.ui.notify(
-      `Couldn't switch the session in place: ${describeUnsupported(reason)}. Falling back to onSwitch.`,
+      `Couldn't switch the session in place: ${describeUnsupportedSwitch(switchResult.reason)}. Falling back to onSwitch.`,
       'warning'
     );
     if (switchResult.error) {
@@ -228,10 +219,15 @@ export const cmdList: CmdHandler = async (_args, ctx, deps) => {
       return;
     }
     deps.statusService.positive(ctx, `onSwitch complete: ${target.branch}`);
-    ctx.ui.notify(
-      `onSwitch finished. Note: this pi session has not been moved to ${target.path} — in hook-only mode, onSwitch is expected to have opened pi there in a separate tab/window/pane. To move this session in place instead, set switchBehavior = "in-place".`,
-      'info'
-    );
+    // Only emit the "this session was not moved" reminder when we got here
+    // via fallback (user wanted in-place / both but it failed) — not when
+    // the user explicitly chose hook-only and probably knows the trade-off.
+    if (current.switchBehavior !== 'hook-only') {
+      ctx.ui.notify(
+        `onSwitch finished. Note: this pi session was not moved to ${target.path} because the in-place switch fell back. The hook just ran instead.`,
+        'info'
+      );
+    }
   } catch (err) {
     stopBusy();
     deps.statusService.critical(ctx, 'onSwitch failed');

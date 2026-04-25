@@ -4,6 +4,7 @@ import { ensureExcluded, git, isGitRepo, listWorktrees } from '../services/git.t
 import type { OnCreateHookOptions, ReplacedSessionContext } from './shared.ts';
 import {
   attemptInPlaceSwitch,
+  describeUnsupportedSwitch,
   resolveLogfilePath,
   runHook,
   runOnCreateHook,
@@ -123,23 +124,6 @@ export async function cmdCreate(
   });
 }
 
-function describeUnsupported(reason: string): string {
-  switch (reason) {
-    case 'no-switch-api':
-      return 'pi is too old to switch sessions in place (requires pi >= 0.51.1, and >= 0.65.0 for correct cross-cwd tool rebinding)';
-    case 'no-session-file':
-      return 'the current session has no persistent file (started with --no-session?)';
-    case 'fork-failed':
-      return 'forking the session file into the worktree failed';
-    case 'switch-cancelled':
-      return 'another extension cancelled the session switch';
-    case 'switch-failed':
-      return 'pi returned an error while switching the session';
-    default:
-      return reason;
-  }
-}
-
 async function handleExistingWorktree(
   ctx: ExtensionCommandContext,
   deps: CommandDeps,
@@ -156,7 +140,7 @@ async function handleExistingWorktree(
 
   const confirmMessage = wantsSwitch
     ? `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nSwitch this pi session into the worktree?${
-        wantsHook ? ' (onSwitch will run after the switch.)' : ''
+        wantsHook && current.onSwitch ? ' (onSwitch will run after the switch.)' : ''
       }`
     : current.onSwitch
       ? `Path: ${existingWorktree.path}\nBranch: ${existingWorktree.branch}\n\nRun onSwitch for this worktree?`
@@ -235,7 +219,10 @@ async function handleExistingWorktree(
     }
 
     if (switchResult.status === 'already-here') {
-      ctx.ui.notify(`Already working in ${existingWorktree.path}.`, 'info');
+      ctx.ui.notify(
+        `This pi session is already rooted at ${existingWorktree.path}. No switch needed.`,
+        'info'
+      );
       if (wantsHook) {
         await runOnSwitchHook(ctx.ui.notify.bind(ctx.ui));
       }
@@ -243,7 +230,7 @@ async function handleExistingWorktree(
     }
 
     ctx.ui.notify(
-      `Couldn't switch the session in place: ${describeUnsupported(switchResult.reason)}. Falling back to onSwitch.`,
+      `Couldn't switch the session in place: ${describeUnsupportedSwitch(switchResult.reason)}. Falling back to onSwitch.`,
       'warning'
     );
     if (switchResult.error) {
@@ -275,8 +262,10 @@ async function handleExistingWorktree(
     return;
   }
   ctx.ui.notify(`Worktree path: ${existingWorktree.path}`, 'info');
-  ctx.ui.notify(
-    `onSwitch finished. Note: this pi session has not been moved to ${existingWorktree.path} — in hook-only mode, onSwitch is expected to have opened pi there in a separate tab/window/pane. To move this session in place instead, set switchBehavior = "in-place".`,
-    'info'
-  );
+  if (current.switchBehavior !== 'hook-only') {
+    ctx.ui.notify(
+      `onSwitch finished. Note: this pi session was not moved to ${existingWorktree.path} because the in-place switch fell back. The hook just ran instead.`,
+      'info'
+    );
+  }
 }

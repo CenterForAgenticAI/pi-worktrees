@@ -141,7 +141,7 @@ describe('cmdInit persistence', () => {
     const { ctx } = createFakeCtx({
       selects: [
         'Default ({{mainWorktree}}.worktrees)',
-        'hook-only (just run onSwitch, leave this pi session where it is)',
+        'hook-only — just run onSwitch, leave this session in main',
       ],
       inputs: ['make setup', '', ''],
       confirm: true,
@@ -166,7 +166,7 @@ describe('cmdInit persistence', () => {
     const { ctx } = createFakeCtx({
       selects: [
         'Default ({{mainWorktree}}.worktrees)',
-        'in-place (move this pi session into the selected worktree; requires pi >= 0.65.0)',
+        'in-place — move this pi session into the worktree',
       ],
       inputs: ['make setup', '', ''],
       confirm: true,

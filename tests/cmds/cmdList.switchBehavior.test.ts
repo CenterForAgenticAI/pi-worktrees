@@ -200,9 +200,26 @@ describe('cmdList switchBehavior=hook-only', () => {
     const fullText = notify.mock.calls.map((c) => String(c[0])).join('\n');
     expect(fullText).toMatch(/onSwitch steps:/);
     expect(fullText).toContain('echo hook');
-    // Post-hook reminder explains the hook-only stance.
-    expect(fullText).toMatch(/has not been moved/);
-    expect(fullText).toContain('switchBehavior = "in-place"');
+    // Users who explicitly opted into hook-only should NOT be lectured
+    // about their session not moving — they know.
+    expect(fullText).not.toMatch(/has not been moved/);
+    expect(fullText).not.toMatch(/was not moved/);
+  });
+
+  it('emits the "session not moved" notice when in-place falls back to hook-only', async () => {
+    const deps = createDeps({
+      switchBehavior: 'in-place',
+      onSwitch: 'echo fallback-hook',
+    });
+    const ctx = createCtx({ switchSession: undefined });
+
+    await cmdList('', ctx as never, deps);
+
+    const fullText = notify.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(fullText).toMatch(/Couldn't switch the session in place/);
+    expect(fullText).toMatch(/onSwitch steps:/);
+    // Reminder fires here because the user wanted in-place.
+    expect(fullText).toMatch(/was not moved/);
   });
 
   it('prints guidance (not "No onSwitch configured") when no hook is set', async () => {
