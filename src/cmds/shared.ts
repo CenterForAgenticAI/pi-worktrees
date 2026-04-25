@@ -1,10 +1,15 @@
-import { appendFileSync, existsSync, unlinkSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, mkdirSync, unlinkSync, writeFileSync } from 'fs';
 import { spawn } from 'child_process';
 import { realpathSync } from 'fs';
-import { resolve as resolvePath } from 'path';
+import { randomUUID } from 'node:crypto';
+import { join as joinPath, resolve as resolvePath } from 'path';
 import type { ExtensionCommandContext } from '@mariozechner/pi-coding-agent';
 import * as pi from '@mariozechner/pi-coding-agent';
-import { SessionManager } from '@mariozechner/pi-coding-agent';
+import {
+  CURRENT_SESSION_VERSION,
+  getAgentDir,
+  SessionManager,
+} from '@mariozechner/pi-coding-agent';
 
 // Feature-detect cross-cwd session replacement support.
 // `createAgentSessionRuntime` was introduced in pi 0.65.0 alongside the
@@ -132,6 +137,83 @@ function tryCleanupSessionFile(path: string): void {
 }
 
 /**
+ * Mirror of pi's `getDefaultSessionDir` so we can resolve the target cwd's
+ * session bucket without needing to call into pi's private helpers (only `.`
+ * and `./hooks` subpaths are public). The encoding scheme is intentionally
+ * tiny:
+ *   ~/.pi/agent/sessions/--<cwd-with-slashes-and-colons-as-dashes>--
+ * Kept in lockstep with packages/coding-agent/src/core/session-manager.ts in
+ * pi-mono. If pi changes the scheme this would silently drift, so the helper
+ * is exercised by an integration test against a known-good encoding.
+ */
+function defaultSessionDirForCwd(cwd: string): string {
+  const safePath = `--${cwd.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
+  return joinPath(getAgentDir(), 'sessions', safePath);
+}
+
+/**
+ * Build a forked session file for `targetCwd` directly from the live
+ * SessionManager's in-memory state, bypassing the requirement that the source
+ * file already be flushed to disk.
+ *
+ * Why this exists: pi's `SessionManager.forkFrom` reads the source JSONL
+ * from disk and rejects when the source has zero entries (`Cannot fork:
+ * source session file is empty or invalid`). Brand-new pi sessions — i.e.
+ * the user just started pi and hasn't generated any persisted entries yet
+ * — hit this path even though the in-memory session has a header and at
+ * least the synthetic `model_change` entry. We replicate forkFrom's output
+ * shape (new id, header rewritten with target cwd + parentSession pointer,
+ * non-header entries copied) using ctx.sessionManager.getHeader() and
+ * getEntries() instead.
+ */
+function buildForkInMemory(
+  ctx: ExtensionCommandContext,
+  sourceSessionFile: string,
+  targetCwd: string
+): string {
+  const header = ctx.sessionManager?.getHeader?.();
+  const entries = ctx.sessionManager?.getEntries?.() ?? [];
+  if (!header) {
+    throw new Error('Cannot fork: live session has no header');
+  }
+
+  const sessionDir = defaultSessionDirForCwd(targetCwd);
+  if (!existsSync(sessionDir)) {
+    mkdirSync(sessionDir, { recursive: true });
+  }
+
+  const newSessionId = randomUUID();
+  const timestamp = new Date().toISOString();
+  const fileTimestamp = timestamp.replace(/[:.]/g, '-');
+  const newSessionFile = joinPath(sessionDir, `${fileTimestamp}_${newSessionId}.jsonl`);
+
+  // Only record `parentSession` when the source file is actually on disk.
+  // For brand-new pi sessions, getSessionFile() returns the planned path
+  // before pi has flushed anything, and we'd end up writing a dangling
+  // pointer that never resolves.
+  const sourceOnDisk = existsSync(sourceSessionFile);
+  const newHeader: Record<string, unknown> = {
+    type: 'session',
+    version: (header as { version?: number }).version ?? CURRENT_SESSION_VERSION,
+    id: newSessionId,
+    timestamp,
+    cwd: targetCwd,
+  };
+  if (sourceOnDisk) {
+    newHeader.parentSession = sourceSessionFile;
+  }
+  appendFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`);
+
+  for (const entry of entries) {
+    if ((entry as { type?: string }).type !== 'session') {
+      appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
+    }
+  }
+
+  return newSessionFile;
+}
+
+/**
  * Fork the current session into the target cwd's bucket and ask pi to switch
  * into it. On pi >= 0.65.0 this rebuilds every cwd-bound service (bash/read/
  * write/edit/grep tools, footer, session dir) to point at `target.path`; on
@@ -173,24 +255,36 @@ export async function attemptInPlaceSwitch(
     return { status: 'unsupported', reason: 'no-session-file' };
   }
 
+  // Prefer pi's SessionManager.forkFrom (it's the public API; if pi later
+  // adds migrations or validation, they live there). Fall back to building
+  // the fork from the live in-memory session when forkFrom rejects because
+  // the source file hasn't been flushed yet — a real case for pi sessions
+  // that haven't persisted any entries to disk.
   let forkedSessionFile: string;
   try {
     const forked = SessionManager.forkFrom(sourceSessionFile, targetPath);
     const filePath = forked.getSessionFile();
     if (!filePath) {
+      throw new Error('forkFrom() returned a SessionManager with no session file');
+    }
+    forkedSessionFile = filePath;
+  } catch (forkError) {
+    try {
+      forkedSessionFile = buildForkInMemory(ctx, sourceSessionFile, targetPath);
+    } catch (inMemoryError) {
       return {
         status: 'unsupported',
         reason: 'fork-failed',
-        error: new Error('forkFrom() returned a SessionManager with no session file'),
+        error:
+          inMemoryError instanceof Error
+            ? inMemoryError
+            : new Error(
+                `forkFrom failed (${
+                  forkError instanceof Error ? forkError.message : String(forkError)
+                }) and in-memory fallback also failed: ${String(inMemoryError)}`
+              ),
       };
     }
-    forkedSessionFile = filePath;
-  } catch (err) {
-    return {
-      status: 'unsupported',
-      reason: 'fork-failed',
-      error: err instanceof Error ? err : new Error(String(err)),
-    };
   }
 
   // `withSessionRan` distinguishes "switch failed before pi rebuilt the

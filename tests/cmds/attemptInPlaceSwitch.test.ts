@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -10,6 +10,11 @@ import { attemptInPlaceSwitch, describeUnsupportedSwitch } from '../../src/cmds/
 const forkFromMock = vi.fn();
 
 vi.mock('@mariozechner/pi-coding-agent', () => ({
+  // The cross-cwd feature-detect in shared.ts looks for this symbol; provide
+  // it so the helper takes the supported path during tests.
+  createAgentSessionRuntime: () => undefined,
+  CURRENT_SESSION_VERSION: 3,
+  getAgentDir: () => process.env.PI_TEST_AGENT_DIR ?? '/tmp/pi-test-agent-dir',
   SessionManager: {
     forkFrom: (...args: unknown[]) => forkFromMock(...args),
   },
@@ -154,20 +159,24 @@ describe('attemptInPlaceSwitch', () => {
     expect(forkFromMock).not.toHaveBeenCalled();
   });
 
-  it('returns "fork-failed" and wraps the thrown error', async () => {
+  it('returns "fork-failed" with the in-memory fallback error when forkFrom AND the fallback both fail', async () => {
+    // Default ctx has no getHeader/getEntries, so the in-memory fallback
+    // can't recover. forkFrom throwing should not lose visibility of the
+    // failure mode — the error reflects the fallback attempt.
     const ctx = ctxWith();
-    const boom = new Error('disk full');
     forkFromMock.mockImplementation(() => {
-      throw boom;
+      throw new Error('Cannot fork: source session file is empty or invalid');
     });
 
-    const result = await attemptInPlaceSwitch(ctx as never, { path: '/worktrees/feature-a' });
-
-    expect(result).toMatchObject({
-      status: 'unsupported',
-      reason: 'fork-failed',
-      error: boom,
+    const result = await attemptInPlaceSwitch(ctx as never, {
+      path: '/worktrees/feature-a',
     });
+
+    expect(result.status).toBe('unsupported');
+    if (result.status !== 'unsupported') return;
+    expect(result.reason).toBe('fork-failed');
+    // The error mentions the missing header, indicating the fallback path ran.
+    expect(result.error?.message).toMatch(/no header/i);
     expect(ctx.switchSession).not.toHaveBeenCalled();
   });
 
@@ -254,6 +263,161 @@ describe('attemptInPlaceSwitch orphan cleanup', () => {
 
     expect(result).toMatchObject({ status: 'switched' });
     expect(existsSync(activePath)).toBe(true);
+  });
+});
+
+describe('attemptInPlaceSwitch in-memory fork fallback', () => {
+  it('falls back to building the fork from live SessionManager state when forkFrom rejects', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'pi-test-agent-'));
+    process.env.PI_TEST_AGENT_DIR = tmp;
+
+    forkFromMock.mockImplementation(() => {
+      throw new Error('Cannot fork: source session file is empty or invalid');
+    });
+
+    const ctx = ctxWith({
+      sessionManager: {
+        getSessionFile: () => '/tmp/source-session.jsonl',
+        getHeader: () => ({
+          type: 'session',
+          version: 3,
+          id: 'src-id',
+          timestamp: '2026-04-25T18:00:00.000Z',
+          cwd: '/main/repo',
+        }),
+        getEntries: () => [
+          {
+            type: 'session',
+            version: 3,
+            id: 'src-id',
+            timestamp: '2026-04-25T18:00:00.000Z',
+            cwd: '/main/repo',
+          },
+          {
+            type: 'model_change',
+            id: 'mc-1',
+            parentId: null,
+            timestamp: '2026-04-25T18:00:01.000Z',
+            provider: 'anthropic',
+            modelId: 'claude-opus-4-7',
+          },
+          {
+            type: 'message',
+            id: 'm-1',
+            parentId: 'mc-1',
+            timestamp: '2026-04-25T18:00:02.000Z',
+            message: { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+          },
+        ],
+      } as unknown as MockCtx['sessionManager'],
+    });
+
+    const result = await attemptInPlaceSwitch(ctx as never, {
+      path: '/worktrees/feature-a',
+    });
+
+    expect(result.status).toBe('switched');
+    if (result.status !== 'switched') return;
+
+    // The forked file should land in the target cwd's session bucket.
+    expect(result.forkedSessionFile).toMatch(/sessions\/--worktrees-feature-a--\/.+\.jsonl$/);
+    expect(existsSync(result.forkedSessionFile)).toBe(true);
+
+    const lines = readFileSync(result.forkedSessionFile, 'utf-8').trim().split('\n');
+    const header = JSON.parse(lines[0]);
+    expect(header).toMatchObject({
+      type: 'session',
+      version: 3,
+      cwd: '/worktrees/feature-a',
+    });
+    // Header gets a fresh id, distinct from the source.
+    expect(header.id).not.toBe('src-id');
+    // Source file does not exist (path is fictional in this test); parentSession
+    // should be omitted to avoid dangling pointers.
+    expect(header).not.toHaveProperty('parentSession');
+    // Non-header entries are copied verbatim.
+    expect(lines).toHaveLength(3); // header + model_change + message
+    expect(JSON.parse(lines[1])).toMatchObject({ type: 'model_change' });
+    expect(JSON.parse(lines[2])).toMatchObject({ type: 'message' });
+
+    // ctx.switchSession was invoked with the in-memory-built file.
+    expect(ctx.switchSession).toHaveBeenCalledWith(result.forkedSessionFile, expect.any(Object));
+
+    delete process.env.PI_TEST_AGENT_DIR;
+  });
+
+  it('reports fork-failed when the in-memory fallback cannot find a header either', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'pi-test-agent-'));
+    process.env.PI_TEST_AGENT_DIR = tmp;
+
+    forkFromMock.mockImplementation(() => {
+      throw new Error('Cannot fork: source session file is empty or invalid');
+    });
+
+    const ctx = ctxWith({
+      sessionManager: {
+        getSessionFile: () => '/tmp/source-session.jsonl',
+        getHeader: () => undefined,
+        getEntries: () => [],
+      } as unknown as MockCtx['sessionManager'],
+    });
+
+    const result = await attemptInPlaceSwitch(ctx as never, {
+      path: '/worktrees/feature-a',
+    });
+
+    expect(result.status).toBe('unsupported');
+    if (result.status !== 'unsupported') return;
+    expect(result.reason).toBe('fork-failed');
+    expect(result.error?.message).toMatch(/no header/i);
+
+    delete process.env.PI_TEST_AGENT_DIR;
+  });
+
+  it('records parentSession when the source session file is on disk', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'pi-test-agent-'));
+    process.env.PI_TEST_AGENT_DIR = tmp;
+
+    // Create a real on-disk source file so existsSync() returns true.
+    const sourcePath = join(tmp, 'real-source.jsonl');
+    writeFileSync(sourcePath, '{"type":"session","version":3,"id":"src-id","cwd":"/main/repo"}\n');
+
+    forkFromMock.mockImplementation(() => {
+      throw new Error('Cannot fork: source session file is empty or invalid');
+    });
+
+    const ctx = ctxWith({
+      sessionManager: {
+        getSessionFile: () => sourcePath,
+        getHeader: () => ({
+          type: 'session',
+          version: 3,
+          id: 'src-id',
+          timestamp: '2026-04-25T18:00:00.000Z',
+          cwd: '/main/repo',
+        }),
+        getEntries: () => [
+          {
+            type: 'session',
+            version: 3,
+            id: 'src-id',
+            timestamp: '2026-04-25T18:00:00.000Z',
+            cwd: '/main/repo',
+          },
+        ],
+      } as unknown as MockCtx['sessionManager'],
+    });
+
+    const result = await attemptInPlaceSwitch(ctx as never, {
+      path: '/worktrees/feature-b',
+    });
+
+    expect(result.status).toBe('switched');
+    if (result.status !== 'switched') return;
+    const header = JSON.parse(readFileSync(result.forkedSessionFile, 'utf-8').split('\n')[0]);
+    expect(header.parentSession).toBe(sourcePath);
+
+    delete process.env.PI_TEST_AGENT_DIR;
   });
 });
 
