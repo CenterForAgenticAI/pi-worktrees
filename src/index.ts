@@ -82,11 +82,15 @@ Use '/worktree create feature/<name> --name <name>' to preserve old semantics.
 Hook vars: {{path}}, {{name}}, {{branch}}, {{project}}, {{mainWorktree}}
 Hooks: onCreate (new), onSwitch (existing), onBeforeRemove (pre-delete, non-zero blocks)
 switchBehavior: in-place (default) | hook-only | both
+  Applies to /worktree list, and to /worktree create both for new worktrees
+  (after onCreate runs) and for re-entering existing ones.
   in-place: forks the current session into the worktree's cwd bucket and asks
             pi to switch into it, so bash/read/write/edit all rebind to the
             new cwd. Requires pi >= 0.65.0 for correct cross-cwd rebinding.
   hook-only: legacy behavior; runs onSwitch and leaves this pi session alone.
+            For new worktrees, just runs onCreate and stays put.
   both: switch in place, then run onSwitch inside the replaced session.
+        For new worktrees: onCreate -> switch -> onSwitch (layered hooks).
 Logfile vars: {sessionId} / {{sessionId}}, {name} / {{name}}, {timestamp} / {{timestamp}}
 `.trim();
 

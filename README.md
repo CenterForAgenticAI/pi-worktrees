@@ -248,17 +248,18 @@ Where new worktrees are created.
 
 ### `switchBehavior`
 
-Controls what happens when you select an existing worktree via `/worktree list`
-or re-enter one via `/worktree create`.
+Controls what happens when you select an existing worktree via `/worktree list`,
+re-enter one via `/worktree create`, or finish creating a new one with
+`/worktree create <new-branch>`.
 
 - **Default:** `"in-place"`
 - Values: `"in-place"`, `"hook-only"`, `"both"`
 
-| Mode | Session cwd | `onSwitch` runs? |
-|---|---|---|
-| `"in-place"` (default) | Moved into the worktree | No |
-| `"hook-only"` | Unchanged | Yes (if configured) |
-| `"both"` | Moved into the worktree | Yes, inside the replaced session |
+| Mode | Session cwd | `onSwitch` runs? | Notes for new worktrees |
+|---|---|---|---|
+| `"in-place"` (default) | Moved into the worktree | No | After `onCreate`, the session moves into the new worktree. |
+| `"hook-only"` | Unchanged | Yes (if configured) | Legacy behavior — stay in main, no auto-switch. |
+| `"both"` | Moved into the worktree | Yes, inside the replaced session | `onCreate` then switch then `onSwitch` — use `onCreate` for first-time setup, `onSwitch` for every-time-you-enter setup. |
 
 **How in-place switching works:** the extension calls
 `SessionManager.forkFrom(currentSessionFile, worktreePath)` to write a new

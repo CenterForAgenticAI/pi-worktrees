@@ -112,7 +112,7 @@ export async function cmdCreate(
     timestamp,
   });
 
-  await runOnCreateHook(createdCtx, current, ctx.ui.notify.bind(ctx.ui), {
+  const hookOptions: OnCreateHookOptions = {
     logPath,
     displayOutputMaxLines: current.onCreateDisplayOutputMaxLines,
     cmdDisplayPending: current.onCreateCmdDisplayPending,
@@ -121,7 +121,86 @@ export async function cmdCreate(
     cmdDisplayPendingColor: current.onCreateCmdDisplayPendingColor,
     cmdDisplaySuccessColor: current.onCreateCmdDisplaySuccessColor,
     cmdDisplayErrorColor: current.onCreateCmdDisplayErrorColor,
-  });
+  };
+
+  await runOnCreateHook(createdCtx, current, ctx.ui.notify.bind(ctx.ui), hookOptions);
+
+  // After creation + onCreate, optionally move this pi session into the new
+  // worktree. switchBehavior controls the post-create action:
+  //   in-place / both: switch the running session into the worktree
+  //   hook-only:       leave the session in main (legacy behavior)
+  // For 'both' we run onSwitch inside the replaced session as a
+  // "every-time-you-enter" hook, layered on top of onCreate's
+  // "first-time-only" semantics.
+  if (current.switchBehavior === 'hook-only') {
+    return;
+  }
+
+  await switchIntoNewWorktree(ctx, current, createdCtx, hookOptions);
+}
+
+async function switchIntoNewWorktree(
+  ctx: ExtensionCommandContext,
+  current: ReturnType<CommandDeps['configService']['current']>,
+  createdCtx: WorktreeCreatedContext,
+  hookOptions: OnCreateHookOptions
+): Promise<void> {
+  const wantsHookAfterSwitch = current.switchBehavior === 'both';
+
+  ctx.ui.notify(`Switching session into ${createdCtx.branch} (${createdCtx.path})...`, 'info');
+
+  const switchResult = await attemptInPlaceSwitch(
+    ctx,
+    { path: createdCtx.path },
+    {
+      withSession: async (newCtx) => {
+        newCtx.ui.notify(
+          `✓ Switched. This pi session is now working in ${createdCtx.path}. Session history was preserved.`,
+          'info'
+        );
+        if (wantsHookAfterSwitch && current.onSwitch) {
+          const result = await runHook(
+            createdCtx,
+            current.onSwitch,
+            'onSwitch',
+            newCtx.ui.notify.bind(newCtx.ui),
+            hookOptions
+          );
+          if (!result.success) {
+            newCtx.ui.notify('onSwitch failed', 'error');
+          }
+        }
+      },
+    }
+  );
+
+  if (switchResult.status === 'switched') {
+    return;
+  }
+
+  if (switchResult.status === 'already-here') {
+    // Unusual: user ran /worktree create from inside the path that ended up
+    // matching. Surface it without dressing it up.
+    ctx.ui.notify(
+      `This pi session is already rooted at ${createdCtx.path}. No switch needed.`,
+      'info'
+    );
+    return;
+  }
+
+  // unsupported — do not run a fallback hook here. onCreate already ran;
+  // there's nothing meaningful left to do besides telling the user.
+  ctx.ui.notify(
+    `Couldn't switch into the new worktree: ${describeUnsupportedSwitch(switchResult.reason)}.`,
+    'warning'
+  );
+  if (switchResult.error) {
+    ctx.ui.notify(switchResult.error.message, 'error');
+  }
+  ctx.ui.notify(
+    `Worktree created at ${createdCtx.path}. To work in it, either exit and run \`cd ${createdCtx.path} && pi\`, or run /worktree list to switch later.`,
+    'info'
+  );
 }
 
 async function handleExistingWorktree(
