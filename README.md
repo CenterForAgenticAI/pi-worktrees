@@ -1,6 +1,12 @@
 # `@zenobius/pi-worktrees`
 
+> [!WARNING]
+> Abandoned. 
+>
+> I don't use this anymore. Instead I use [worktrunk](https://github.com/max-sixty/worktrunk).
+
 <img width="1531" height="1172" alt="image" src="https://github.com/user-attachments/assets/33fe4c01-4d9b-41ec-a326-116db6e750df" />
+
 
 
 Git worktree management for [Pi Coding Agent](https://github.com/badlogic/pi-mono) with a clean `/worktree` command surface.
